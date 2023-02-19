@@ -18,8 +18,7 @@ from aiogithubapi import (
 from aiogithubapi.const import BASE_API_URL
 from aiogithubapi.objects.repository import AIOGitHubAPIRepository
 import attr
-from homeassistant.helpers import device_registry as dr
-from homeassistant.components.repairs import async_delete_issue
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
 
 from ..const import DOMAIN
 from ..enums import ConfigurationType, HacsDispatchEvent, RepositoryFile
@@ -51,16 +50,27 @@ if TYPE_CHECKING:
 
 
 TOPIC_FILTER = (
+    "add-on",
+    "addon",
+    "app",
+    "appdaemon-apps",
+    "appdaemon",
     "custom-card",
+    "custom-cards",
     "custom-component",
     "custom-components",
     "customcomponents",
     "hacktoberfest",
     "hacs-default",
     "hacs-integration",
+    "hacs-repository",
     "hacs",
     "hass",
     "hassio",
+    "home-assistant-custom",
+    "home-assistant-frontend",
+    "home-assistant-hacs",
+    "home-assistant-sensor",
     "home-assistant",
     "home-automation",
     "homeassistant-components",
@@ -69,16 +79,45 @@ TOPIC_FILTER = (
     "homeassistant",
     "homeautomation",
     "integration",
+    "lovelace-ui",
     "lovelace",
+    "media-player",
+    "mediaplayer",
+    "netdaemon",
+    "plugin",
+    "python_script",
+    "python-script",
     "python",
     "sensor",
+    "smart-home",
+    "smarthome",
     "theme",
     "themes",
-    "custom-cards",
-    "home-assistant-frontend",
-    "home-assistant-hacs",
-    "home-assistant-custom",
-    "lovelace-ui",
+)
+
+
+REPOSITORY_KEYS_TO_EXPORT = (
+    # Keys can not be removed from this list until v3
+    # If keys are added, the action need to be re-run with force
+    ("description", ""),
+    ("downloads", 0),
+    ("domain", None),
+    ("etag_repository", None),
+    ("full_name", ""),
+    ("last_commit", None),
+    ("last_updated", 0),
+    ("last_version", None),
+    ("manifest_name", None),
+    ("open_issues", 0),
+    ("stargazers_count", 0),
+    ("topics", []),
+)
+
+HACS_MANIFEST_KEYS_TO_EXPORT = (
+    # Keys can not be removed from this list until v3
+    # If keys are added, the action need to be re-run with force
+    ("country", []),
+    ("name", None),
 )
 
 
@@ -121,7 +160,6 @@ class RepositoryData:
     new: bool = True
     open_issues: int = 0
     published_tags: list[str] = []
-    pushed_at: str = ""
     releases: bool = False
     selected_tag: str = None
     show_beta: bool = False
@@ -148,32 +186,24 @@ class RepositoryData:
 
     def update_data(self, data: dict, action: bool = False) -> None:
         """Update data of the repository."""
-        for key in data:
+        for key, value in data.items():
             if key not in self.__dict__:
                 continue
-            if key == "pushed_at":
-                if data[key] == "":
-                    continue
-                if "Z" in data[key]:
-                    setattr(
-                        self,
-                        key,
-                        datetime.strptime(data[key], "%Y-%m-%dT%H:%M:%SZ"),
-                    )
-                else:
-                    setattr(self, key, datetime.strptime(data[key], "%Y-%m-%dT%H:%M:%S"))
+
+            if key == "last_fetched" and isinstance(value, float):
+                setattr(self, key, datetime.fromtimestamp(value))
             elif key == "id":
-                setattr(self, key, str(data[key]))
+                setattr(self, key, str(value))
             elif key == "country":
-                if isinstance(data[key], str):
-                    setattr(self, key, [data[key]])
+                if isinstance(value, str):
+                    setattr(self, key, [value])
                 else:
-                    setattr(self, key, data[key])
+                    setattr(self, key, value)
             elif key == "topics" and not action:
-                setattr(self, key, [topic for topic in data[key] if topic not in TOPIC_FILTER])
+                setattr(self, key, [topic for topic in value if topic not in TOPIC_FILTER])
 
             else:
-                setattr(self, key, data[key])
+                setattr(self, key, value)
 
 
 @attr.s(auto_attribs=True)
@@ -215,6 +245,20 @@ class HacsManifest:
             elif key in manifest_data.__dict__:
                 setattr(manifest_data, key, value)
         return manifest_data
+
+    def update_data(self, data: dict) -> None:
+        """Update the manifest data."""
+        for key, value in data.items():
+            if key not in self.__dict__:
+                continue
+
+            if key == "country":
+                if isinstance(value, str):
+                    setattr(self, key, [value])
+                else:
+                    setattr(self, key, value)
+            else:
+                setattr(self, key, value)
 
 
 class RepositoryReleases:
@@ -450,6 +494,10 @@ class HacsRepository:
                 self.logger.debug("%s Did not update, content was not modified", self.string)
                 return
 
+        if self.repository_object:
+            self.data.last_updated = self.repository_object.attributes.get("pushed_at", 0)
+            self.data.last_fetched = datetime.utcnow()
+
         # Set topics
         self.data.topics = self.data.topics
 
@@ -498,7 +546,7 @@ class HacsRepository:
         self.additional_info = await self.async_get_info_file_contents()
 
         # Set last fetch attribute
-        self.data.last_fetched = datetime.now()
+        self.data.last_fetched = datetime.utcnow()
 
         return True
 
@@ -698,9 +746,8 @@ class HacsRepository:
 
     def remove(self) -> None:
         """Run remove tasks."""
-        self.logger.info("%s Starting removal", self.string)
-
         if self.hacs.repositories.is_registered(repository_id=str(self.data.id)):
+            self.logger.info("%s Starting removal", self.string)
             self.hacs.repositories.unregister(self)
 
     async def uninstall(self) -> None:
@@ -735,7 +782,7 @@ class HacsRepository:
         )
 
         await self.async_remove_entity_device()
-        async_delete_issue(self.hacs.hass, DOMAIN, f"removed_{self.data.id}")
+        ir.async_delete_issue(self.hacs.hass, DOMAIN, f"removed_{self.data.id}")
 
     async def remove_local_directory(self) -> None:
         """Check the local directory."""
@@ -782,7 +829,9 @@ class HacsRepository:
                     "%s Presumed local content path %s does not exist", self.string, local_path
                 )
 
-        except BaseException as exception:  # lgtm [py/catch-base-exception] pylint: disable=broad-except
+        except (
+            BaseException  # lgtm [py/catch-base-exception] pylint: disable=broad-except
+        ) as exception:
             self.logger.debug("%s Removing %s failed with %s", self.string, local_path, exception)
             return False
         return True
@@ -995,7 +1044,12 @@ class HacsRepository:
             releases.append(release)
         return releases
 
-    async def common_update_data(self, ignore_issues: bool = False, force: bool = False) -> None:
+    async def common_update_data(
+        self,
+        ignore_issues: bool = False,
+        force: bool = False,
+        retry=False,
+    ) -> None:
         """Common update data."""
         releases = []
         try:
@@ -1007,7 +1061,11 @@ class HacsRepository:
                 self.hacs.common.renamed_repositories[
                     self.data.full_name
                 ] = repository_object.full_name
-                raise HacsRepositoryExistException
+                if not self.hacs.system.generator:
+                    raise HacsRepositoryExistException
+                self.logger.error(
+                    "%s Repository has been renamed - %s", self.string, repository_object.full_name
+                )
             self.data.update_data(
                 repository_object.attributes,
                 action=self.hacs.system.action,
@@ -1061,6 +1119,9 @@ class HacsRepository:
                     if assets := release.assets:
                         downloads = next(iter(assets)).download_count
                         self.data.downloads = downloads
+        elif self.hacs.system.generator and self.repository_object:
+            await self.repository_object.set_last_commit()
+            self.data.last_commit = self.repository_object.last_commit
 
         self.hacs.log.debug(
             "%s Running checks against %s", self.string, self.ref.replace("tags/", "")
@@ -1074,6 +1135,20 @@ class HacsRepository:
             for treefile in self.tree:
                 self.treefiles.append(treefile.full_path)
         except (AIOGitHubAPIException, HacsException) as exception:
+            if (
+                not retry
+                and self.ref is not None
+                and str(exception).startswith("GitHub returned 404")
+            ):
+                # Handle tags/branches being deleted.
+                self.data.selected_tag = None
+                self.ref = self.version_to_download()
+                self.logger.warning(
+                    "%s Selected version/branch %s has been removed, falling back to default",
+                    self.string,
+                    self.ref,
+                )
+                return await self.common_update_data(ignore_issues, force, True)
             if not self.hacs.status.startup and not ignore_issues:
                 self.logger.error("%s %s", self.string, exception)
             if not ignore_issues:
@@ -1176,7 +1251,9 @@ class HacsRepository:
                 return
             self.validate.errors.append(f"[{content.name}] was not downloaded.")
 
-        except BaseException as exception:  # lgtm [py/catch-base-exception] pylint: disable=broad-except
+        except (
+            BaseException  # lgtm [py/catch-base-exception] pylint: disable=broad-except
+        ) as exception:
             self.validate.errors.append(f"Download was not completed [{exception}]")
 
     async def async_remove_entity_device(self) -> None:
